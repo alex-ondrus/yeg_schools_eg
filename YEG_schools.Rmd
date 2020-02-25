@@ -1,0 +1,305 @@
+---
+title: "YEG School Placement"
+author: "Alexander Ondrus"
+date: "2/24/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(rgeos)
+library(rgdal)
+library(maptools)
+library(kableExtra)
+library(ggrepel)
+library(geosphere)
+library(gganimate)
+```
+
+## Idea/Background
+
+The placement of schools and the programming offered at those schools has long been a subject of much public interest. The issue frequently makes the news (e.g. [here](https://edmontonjournal.com/news/local-news/summerside-parents-say-theyve-been-blindsided-by-proposed-school-boundary-changes)) and the tension is most frequently "Are the kids in the same place as the schools?" Here, I attempt to answer that question in multiple ways. To make things simpler, I restrict my questions to elementary schools (or schools that include elementary schools) and kids under the age of 10 (the census data is in 5 year increments).
+
+## Data
+
+All data is taken from the City of Edmonton Open Data Catalogue. I use the following sources:
+
+- [2019 Census - Population by Age Range (Neighbourhood/Ward)](https://data.edmonton.ca/Census/2019-Census-Population-by-Age-Range-Neighbourhood-/a6zx-dzqn)
+- [Edmonton Public Schools (2019)](https://data.edmonton.ca/Schools/Edmonton-Public-Schools-2019-/nk6t-8jsz)
+- [Edmonton Catholic Schools (2017-2018)](https://data.edmonton.ca/Schools/Edmonton-Catholic-Schools-2017-2018-/u2mw-7vq5)
+- [City of Edmonton - Neighbourhoods (Centroid Point)](https://data.edmonton.ca/City-Administration/City-of-Edmonton-Neighbourhoods-Centroid-Point-/3b6m-fezs/data)
+- [City of Edmonton : Neighbourhood Boundaries ](https://data.edmonton.ca/Geospatial-Boundaries/City-of-Edmonton-Neighbourhood-Boundaries/jfvj-x253)
+
+```{r load in data, message=FALSE, warning=FALSE}
+epsb <- read_csv("https://data.edmonton.ca/resource/nk6t-8jsz.csv")
+ed_catholic <- read_csv("https://data.edmonton.ca/resource/u2mw-7vq5.csv")
+nbhd_centroids <- read_csv("https://data.edmonton.ca/resource/3b6m-fezs.csv")
+nbhd_bounds <- readOGR("City of Edmonton _ Neighbourhood Boundaries/geo_export_7f6429b0-6d5d-438c-b1ec-c479e30f903a.shp")
+nbhd_ages <- read_csv("2019_Census_-_Population_by_Age_Range__Neighbourhood_Ward_.csv") %>% 
+  select(`Neighbourhood Name`, `Age Range`, `Population`)
+colnames(nbhd_ages) <- c("Neighbourhood", "Age", "Population")
+```
+
+## Processing & Merging
+
+First, I find the number of kids under 10 in each neighbourhood from the City's census data.
+
+```{r kids U10}
+nbhd_kids <- spread(nbhd_ages,
+                    key = "Age",
+                    value = "Population") %>% 
+  mutate(Kids_U10 = `0-4`+`5-9`) %>% 
+  select(Neighbourhood, Kids_U10)
+```
+
+Next, I combine the EPSB and Catholic schools and add a column for the neighbourhood that contains each school. Note again that I only filter for schools that include at least grades K-6.
+
+```{r select merge and locate schools}
+ed_catholic <- select(ed_catholic, school_name, grade_level, grades_offered, location) %>%
+  separate(location, c("latitude", "longitude"), sep = ",")
+
+ed_catholic$latitude <- gsub("(", " ", ed_catholic$latitude, fixed = TRUE) %>% trimws() %>% as.numeric()
+ed_catholic$longitude <- gsub(")", " ", ed_catholic$longitude, fixed = TRUE) %>% trimws() %>% as.numeric()
+
+ed_catholic <- filter(ed_catholic,
+                      str_detect(grade_level, "Elementary")) %>% 
+  select(school_name, latitude, longitude)
+
+epsb <- filter(epsb, str_detect(grades, "K")) %>% 
+  select(school_name, point_y, point_x)
+
+colnames(epsb) <- c("school_name", "latitude", "longitude")
+
+epsb$board <- "EPSB"
+ed_catholic$board <- "Catholic"
+
+schools <- rbind(epsb, ed_catholic)
+
+sp_schools <- schools
+coordinates(sp_schools) <- c("longitude", "latitude")
+proj4string(sp_schools) <- proj4string(nbhd_bounds)
+
+school_nbhd <- over(sp_schools, as(nbhd_bounds, "SpatialPolygons"))
+schools$Neighbourhood <- nbhd_bounds$name[school_nbhd]
+```
+
+Now I start aggregating the following data into a single dataframe that I call `neighbourhoods`, containing the following columns:
+
+- Neighbourhood (names with mixed case)
+- area_sq_km
+- latitude (of centroid)
+- longitude (of centroid)
+- num_schools (number of schools in the neighbourhood)
+- kids_U10
+- kids_U10_binned (for choropleths)
+- km_from_centre (radius from City Centre)
+- nearest_school
+- km_to_nearest_school
+
+I start using the `nbhd_centroids` data frame
+
+```{r warning=FALSE}
+neighbourhoods <- select(nbhd_centroids, name_mixed, area_sq_km, latitude, longitude) %>% 
+  rename(Neighbourhood = name_mixed)
+
+num_schools <- table(schools$Neighbourhood) %>% 
+  data.frame() %>% 
+  rename(Neighbourhood = Var1,
+         num_schools = Freq)
+
+neighbourhoods <- left_join(neighbourhoods, num_schools, by = "Neighbourhood") %>% 
+  left_join(nbhd_kids, by = "Neighbourhood") %>% 
+  filter(!is.na(Kids_U10))
+
+neighbourhoods$Kids_U10_binned <- cut(neighbourhoods$Kids_U10,
+                                      breaks = c(-Inf, 165, 285, 450, Inf),
+                                      labels = c("< 165", "165 - 285", "286 - 450", "> 450"),
+                                      ordered_result = TRUE)
+
+city_centre <- c(-113.4934, 53.5442)
+
+nbhd_longlat <- as.matrix(neighbourhoods[, c("longitude","latitude")])
+rownames(nbhd_longlat) <- neighbourhoods$Neighbourhood
+
+neighbourhoods$km_from_centre <- distVincentyEllipsoid(nbhd_longlat, city_centre)/1000
+```
+
+I define a new function to return the nearest school and the distance to the nearest school for any point in the city.
+
+```{r nearest school}
+nearest_school_function <- function(long, lat){
+  given_point <- c(long,lat)
+  
+  schools_long_lat <- select(schools, longitude, latitude) %>% as.matrix()
+  
+  distances <- distVincentyEllipsoid(schools_long_lat, given_point) /1000
+  min_distance_index <- which(distances == min(distances))
+  
+  min_distance <- distances[min_distance_index]
+  closest_school <- schools$school_name[min_distance_index]
+  
+  return(c(min_distance, closest_school))
+}
+```
+
+With this function, I can add the remaining columns required above.
+
+```{r add nearest schools to neighbourhoods}
+nbhd_closest_schools <- mapply(nearest_school_function,
+                               neighbourhoods$longitude,
+                               neighbourhoods$latitude) %>% 
+  t() %>% as.data.frame() %>% 
+  rename(km_to_nearest_school = V1, nearest_school = V2)
+neighbourhoods <- cbind(neighbourhoods, nbhd_closest_schools)
+neighbourhoods$km_to_nearest_school <- as.numeric(levels(neighbourhoods$km_to_nearest_school))[neighbourhoods$km_to_nearest_school]
+neighbourhoods_w_kids <- filter(neighbourhoods, Kids_U10 > 10)
+```
+
+This gives the data frame as listed above:
+
+```{r show data}
+display_table <- head(neighbourhoods)
+colnames(display_table) <- c("Neighbourhood", "Area", "latitude", "longitude", "Number\nof Schools",
+                             "Kids\nUnder 10", "Kids Under\n10 (binned)", "km from City\nCentre",
+                             "km from\nnearest school", "Nearest\nSchool")
+kable(display_table, digits = 2) %>% kable_styling()
+```
+
+## Visualizing the Placement of Schools
+
+### Kids in Neighbourhoods Without Schools
+
+The first way of looking at this question is to ask: how many children under the age of 10 live in a neighbourhood which does not contain a school? How many live in neighbourhoods with one school? Two? Three?
+
+
+```{r Kids in neighbourhoods vs num of schools}
+plot1_data <- filter(neighbourhoods, Kids_U10 > 10)
+plot1_data$km_from_centre <- cut_number(plot1_data$km_from_centre,
+                                                   n = 4,
+                                                   ordered_result = TRUE)
+plot1_data$labels <- plot1_data$Neighbourhood
+plot1_data$labels[which(!(plot1_data$labels %in%
+                                       c("Walker", "Summerside", "Laurel", "Balwin",
+                                         "Kilkenny", "Hazeldean", "Silver Berry",
+                                         "South Terwillegar", "Windermere", "The Hamptons",
+                                         "Rutherford")))] <- ""
+
+p1 <- ggplot(plot1_data, aes(x = num_schools,
+                                 y = Kids_U10,
+                                 group = num_schools)) +
+  geom_boxplot(outlier.alpha = 0) +
+  geom_point(position = position_jitterdodge(jitter.width = 1.8),
+             aes(colour = km_from_centre)) +
+  scale_color_brewer(palette = "Spectral") +
+  labs(title = "YEG Neighbourhoods - Schools, # Kids, and Distance\nfrom City Centre (2019)",
+       subtitle = "How many kids live in neighbourhoods that have 0 schools? 1 school?...",
+       x = "Number of Schools",
+       y = "Number of Children Under 10 Years Old",
+       colour = "Distance from\nCity Centre (km)",
+       caption = "Data: City of Edmonton Open Data\nCreated by: Alexander Ondrus\nNote: EPSB and Catholic schools including grades K-6") +
+  theme_minimal() +
+  geom_text_repel(aes(label = labels))
+plot(p1)
+```
+
+### Distance to Nearest School
+
+Next, for each neighbourhood, I look at the number of kids under 10 years old and the distance to the nearest elementary school.
+
+```{r distance to school}
+plot2_data <- plot1_data
+plot2_data$labels <- plot2_data$Neighbourhood
+plot2_data$labels[which((plot2_data$km_to_nearest_school < 2) & 
+                          (plot2_data$Kids_U10 < 1000))] <- ""
+
+p2 <- ggplot(plot2_data, aes(x = km_to_nearest_school,
+                             y = Kids_U10)) + 
+  geom_point(aes(colour = km_from_centre)) +
+    scale_color_brewer(palette = "Spectral") +
+  geom_text_repel(aes(label = labels)) +
+  labs(title = "YEG Neighbourhoods - Schools, # Kids, and Distance from City Centre (2019)",
+       subtitle = "How far is each neighbourhood from the nearest school and how many kids live there?",
+       x = "Kilometers from Neighbourhood Centre to Nearest School",
+       y = "Number of Children Under 10 Years Old",
+       colour = "Distance from\nCity Centre (km)",
+       caption = "Data: City of Edmonton Open Data\nCreated by: Alexander Ondrus\nNote: EPSB and Catholic schools including grades K-6") +
+  theme_minimal()
+plot(p2)
+```
+
+In order to overcome the over-plotting issue, we can animate this to look at the neighbourhoods that are closest to each school one-by-one.
+
+```{r distance to school animated}
+plot3_data <- neighbourhoods %>% 
+  filter(nearest_school %in% c("Bishop David Motiuk",
+                              "Johnny Bright School",
+                              "Holyrood School",
+                              "York School",
+                              "Belgravia School"),
+         Kids_U10 > 10)
+plot3_data$labels <- plot3_data$Neighbourhood
+plot3_data$nearest_school <- droplevels(plot3_data$nearest_school)
+
+plot3_data$km_from_centre_binned <- cut(plot3_data$km_from_centre,
+                                        breaks = c(0, 5, 10, 15, Inf),
+                                        labels = c("<5","5-10","10-15",">15"),
+                                        ordered_result = TRUE)
+
+p3 <- ggplot(plot3_data, aes(x = km_to_nearest_school,
+                             y = Kids_U10,
+                             group = nearest_school)) + 
+  geom_point(aes(colour = km_from_centre_binned),
+             size = 2) +
+  geom_text_repel(aes(label = labels), seed = 1) +
+  transition_states(nearest_school) + 
+  labs(title = "YEG Neighbourhoods - Schools, # Kids,\nand Distance from City Centre (2019)",
+       subtitle = "How far is each neighbourhood from {closest_state} and how many kids live there?",
+       x = "Kilometers from Neighbourhood Centre to Nearest School",
+       y = "Number of Children Under 10 Years Old",
+       colour = "Distance from\nCity Centre (km)",
+       caption = "Data: City of Edmonton Open Data\nCreated by: Alexander Ondrus\nNote: EPSB and Catholic schools including grades K-6") +
+  theme_minimal() +
+  enter_fade() + 
+  exit_shrink()
+animate(p3, nframes = 200, duration = 10)
+```
+
+To show how I picked the schools in the animation above, I draw a map of the neighbourhoods in Edmonton with the schools labelled, the neighbourhoods coloured by the number of kids under 10.
+
+```{r map of schools w neighbourhoods}
+nbhd_bounds_fortified <- fortify(nbhd_bounds, region = "name")
+plot4_data <- select(neighbourhoods_w_kids, Neighbourhood, Kids_U10_binned)
+nbhd_bounds_fortified <- left_join(nbhd_bounds_fortified, plot4_data, by = c("id"="Neighbourhood"))
+school_labels <- filter(schools, school_name %in% c("Bishop David Motiuk",
+                              "Johnny Bright School",
+                              "Holyrood School",
+                              "York School",
+                              "Belgravia School"))
+
+p4 <- ggplot(nbhd_bounds_fortified, aes(x = long, y = lat)) +
+  geom_polygon(colour = "grey",
+               aes(group = group, 
+               fill = Kids_U10_binned)) +
+  coord_map() +
+  theme_void() +
+  scale_fill_brewer() +
+  geom_point(data = schools,
+             aes(x = longitude,
+                 y = latitude)) +
+  geom_label_repel(data = school_labels,
+                  aes(x = longitude,
+                      y = latitude,
+                      label = school_name)) +
+  geom_point(data = school_labels,
+             aes(x = longitude,
+                 y = latitude),
+             colour = "red",
+             size = 2) +
+  labs(title = "YEG Neighbourhoods - Schools & # Kids",
+       subtitle = "EPSB and Catholic Schools with K-6 programming and the\nnumber of kids under 10 years old in each neighbourhood.",
+       fill = "Number of Children\nUnder 10",
+       caption = "Data: City of Edmonton Open Data\nCreated by: Alexander Ondrus")
+plot(p4)
+```
+
