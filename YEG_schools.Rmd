@@ -2,7 +2,11 @@
 title: "YEG School Placement"
 author: "Alexander Ondrus"
 date: "2/24/2020"
-output: html_document
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+always_allow_html: yes
 ---
 
 ```{r setup, include=FALSE}
@@ -211,13 +215,14 @@ Next, for each neighbourhood, I look at the number of kids under 10 years old an
 plot2_data <- plot1_data
 plot2_data$labels <- plot2_data$Neighbourhood
 plot2_data$labels[which((plot2_data$km_to_nearest_school < 2) & 
-                          (plot2_data$Kids_U10 < 1000))] <- ""
+                          (plot2_data$Kids_U10 < 1000) | 
+                          (plot2_data$Kids_U10 < 50))] <- ""
 
 p2 <- ggplot(plot2_data, aes(x = km_to_nearest_school,
                              y = Kids_U10)) + 
   geom_point(aes(colour = km_from_centre)) +
     scale_color_brewer(palette = "Spectral") +
-  geom_text_repel(aes(label = labels)) +
+  geom_text_repel(aes(label = labels), force = 5) +
   labs(title = "YEG Neighbourhoods - Schools, # Kids, and Distance from City Centre (2019)",
        subtitle = "How far is each neighbourhood from the nearest school and how many kids live there?",
        x = "Kilometers from Neighbourhood Centre to Nearest School",
@@ -262,7 +267,7 @@ p3 <- ggplot(plot3_data, aes(x = km_to_nearest_school,
   theme_minimal() +
   enter_fade() + 
   exit_shrink()
-animate(p3, nframes = 200, duration = 10)
+animate(p3, nframes = 200, duration = 15)
 ```
 
 To show how I picked the schools in the animation above, I draw a map of the neighbourhoods in Edmonton with the schools labelled, the neighbourhoods coloured by the number of kids under 10.
